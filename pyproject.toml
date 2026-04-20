@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quick_tools"
+version = "0.1.0"
+description = "Small command-line utilities."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+  { name = "Sadanand Modak" }
+]
+
+[project.scripts]
+quick-tools = "quick_tools.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
