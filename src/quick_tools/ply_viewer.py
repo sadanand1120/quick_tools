@@ -2,7 +2,30 @@ import html
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
+
+MAX_BROWSER_POINTS = 2_000_000
+MAX_DIRECT_FILE_BYTES = 256 * 1024 * 1024
+
+_PLY_SCALAR_SIZES = {
+    b"char": 1,
+    b"uchar": 1,
+    b"int8": 1,
+    b"uint8": 1,
+    b"short": 2,
+    b"ushort": 2,
+    b"int16": 2,
+    b"uint16": 2,
+    b"int": 4,
+    b"uint": 4,
+    b"int32": 4,
+    b"uint32": 4,
+    b"float": 4,
+    b"float32": 4,
+    b"double": 8,
+    b"float64": 8,
+}
 
 
 HTML_PAGE = """<!doctype html>
@@ -160,6 +183,7 @@ HTML_PAGE = """<!doctype html>
 
 class _ViewerHandler(BaseHTTPRequestHandler):
     ply_path = None
+    ply_bytes = None
     title = ""
 
     def do_GET(self) -> None:
@@ -170,6 +194,13 @@ class _ViewerHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args) -> None:
         return
+
+    def _write_chunks(self, payload: bytes, chunk_size: int = 1024 * 1024) -> None:
+        try:
+            for start in range(0, len(payload), chunk_size):
+                self.wfile.write(payload[start : start + chunk_size])
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _handle_request(self, send_body: bool) -> None:
         path = urlparse(self.path).path
@@ -188,6 +219,16 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/data.ply":
+            if self.ply_bytes is not None:
+                size = len(self.ply_bytes)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                if send_body:
+                    self._write_chunks(self.ply_bytes)
+                return
+
             size = self.ply_path.stat().st_size
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
@@ -195,21 +236,25 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if send_body:
                 with self.ply_path.open("rb") as handle:
-                    while True:
-                        chunk = handle.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
+                    try:
+                        while True:
+                            chunk = handle.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
             return
 
         self.send_error(404)
 
 
-def _build_handler(ply_path: Path):
+def _build_handler(ply_path: Path, ply_bytes=None):
     class Handler(_ViewerHandler):
         pass
 
     Handler.ply_path = ply_path
+    Handler.ply_bytes = ply_bytes
     Handler.title = ply_path.name
     return Handler
 
@@ -221,12 +266,123 @@ def _print_ssh_hint(port: int) -> None:
     print(f"  then open http://127.0.0.1:{port}/ locally", flush=True)
 
 
+def _read_ply_header(ply_path: Path):
+    with ply_path.open("rb") as handle:
+        first_line = handle.readline()
+        if first_line.strip() != b"ply":
+            raise RuntimeError(f"Unsupported PLY header in {ply_path}")
+
+        format_name = None
+        vertex_count = None
+        vertex_stride = 0
+        vertex_properties = []
+        in_vertex_element = False
+
+        while True:
+            line = handle.readline()
+            if not line:
+                raise RuntimeError(f"Unexpected EOF while reading header from {ply_path}")
+
+            stripped = line.strip()
+            if stripped == b"end_header":
+                return {
+                    "format": format_name,
+                    "vertex_count": vertex_count,
+                    "vertex_stride": vertex_stride,
+                    "vertex_properties": vertex_properties,
+                    "data_offset": handle.tell(),
+                }
+
+            if not stripped:
+                continue
+
+            parts = stripped.split()
+            keyword = parts[0]
+
+            if keyword == b"format" and len(parts) >= 2:
+                format_name = parts[1].decode("ascii")
+                continue
+
+            if keyword == b"element" and len(parts) >= 3:
+                in_vertex_element = parts[1] == b"vertex"
+                if in_vertex_element:
+                    vertex_count = int(parts[2])
+                continue
+
+            if keyword == b"property" and in_vertex_element:
+                if len(parts) < 3 or parts[1] == b"list":
+                    raise RuntimeError(f"Unsupported vertex property layout in {ply_path}")
+                property_type = parts[1]
+                size = _PLY_SCALAR_SIZES.get(property_type)
+                if size is None:
+                    raise RuntimeError(f"Unsupported PLY property type {property_type!r} in {ply_path}")
+                vertex_stride += size
+                vertex_properties.append((property_type.decode("ascii"), parts[2].decode("ascii")))
+
+
+def _build_sampled_ply_bytes(ply_path: Path) -> Optional[bytes]:
+    file_size = ply_path.stat().st_size
+    if file_size <= MAX_DIRECT_FILE_BYTES:
+        return None
+
+    header = _read_ply_header(ply_path)
+    fmt = header["format"]
+    vertex_count = header["vertex_count"]
+    vertex_stride = header["vertex_stride"]
+    data_offset = header["data_offset"]
+    vertex_properties = header["vertex_properties"]
+
+    if fmt not in {"binary_little_endian", "binary_big_endian"}:
+        raise RuntimeError(
+            f"{ply_path.name} is too large to load directly in a browser and unsupported for auto-downsampling"
+        )
+    if not vertex_count or not vertex_stride or not vertex_properties:
+        raise RuntimeError(f"Could not determine vertex layout for {ply_path.name}")
+    if vertex_count <= MAX_BROWSER_POINTS:
+        return None
+
+    step = (vertex_count + MAX_BROWSER_POINTS - 1) // MAX_BROWSER_POINTS
+    sampled_count = (vertex_count + step - 1) // step
+
+    header_lines = [
+        b"ply\n",
+        f"format {fmt} 1.0\n".encode("ascii"),
+        f"element vertex {sampled_count}\n".encode("ascii"),
+    ]
+    header_lines.extend(
+        f"property {property_type} {property_name}\n".encode("ascii")
+        for property_type, property_name in vertex_properties
+    )
+    header_lines.append(b"end_header\n")
+
+    sampled = bytearray(b"".join(header_lines))
+    skip_bytes = (step - 1) * vertex_stride
+
+    with ply_path.open("rb") as handle:
+        handle.seek(data_offset)
+        for _ in range(sampled_count):
+            record = handle.read(vertex_stride)
+            if len(record) != vertex_stride:
+                break
+            sampled.extend(record)
+            if skip_bytes:
+                handle.seek(skip_bytes, 1)
+
+    print(
+        f"Downsampling {ply_path.name} for browser viewing: "
+        f"{vertex_count:,} -> {sampled_count:,} points",
+        flush=True,
+    )
+    return bytes(sampled)
+
+
 def serve_ply_viewer(ply_path: Path, port: int) -> int:
     ply_path = ply_path.expanduser().resolve()
     if not ply_path.is_file():
         raise SystemExit(f"PLY file not found: {ply_path}")
 
-    handler = _build_handler(ply_path)
+    ply_bytes = _build_sampled_ply_bytes(ply_path)
+    handler = _build_handler(ply_path, ply_bytes=ply_bytes)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     local_url = f"http://127.0.0.1:{port}/"
 
