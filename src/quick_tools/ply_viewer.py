@@ -83,6 +83,7 @@ HTML_PAGE = """<!doctype html>
       const container = document.getElementById("app");
       const status = document.getElementById("status");
       const title = __TITLE_JS__;
+      const requestedPointSize = __POINT_SIZE_JS__;
 
       const renderer = new THREE.WebGLRenderer({ antialias: true });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -131,7 +132,7 @@ HTML_PAGE = """<!doctype html>
 
           const radius = geometry.boundingSphere?.radius || 1;
           const material = new THREE.PointsMaterial({
-            size: Math.max(radius / 400, 0.0025),
+            size: requestedPointSize ?? Math.max(radius / 400, 0.0025),
             sizeAttenuation: true,
             vertexColors: geometry.hasAttribute("color"),
           });
@@ -185,6 +186,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
     ply_path = None
     ply_bytes = None
     title = ""
+    point_size = None
 
     def do_GET(self) -> None:
         self._handle_request(send_body=True)
@@ -208,6 +210,7 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             content = (
                 HTML_PAGE.replace("__TITLE_HTML__", html.escape(self.title))
                 .replace("__TITLE_JS__", json.dumps(self.title))
+                .replace("__POINT_SIZE_JS__", "null" if self.point_size is None else repr(self.point_size))
                 .encode("utf-8")
             )
             self.send_response(200)
@@ -249,13 +252,14 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
-def _build_handler(ply_path: Path, ply_bytes=None):
+def _build_handler(ply_path: Path, ply_bytes=None, point_size=None):
     class Handler(_ViewerHandler):
         pass
 
     Handler.ply_path = ply_path
     Handler.ply_bytes = ply_bytes
     Handler.title = ply_path.name
+    Handler.point_size = point_size
     return Handler
 
 
@@ -376,13 +380,49 @@ def _build_sampled_ply_bytes(ply_path: Path) -> Optional[bytes]:
     return bytes(sampled)
 
 
-def serve_ply_viewer(ply_path: Path, port: int) -> int:
+def _show_ply_local(ply_path: Path, point_size: Optional[float]) -> int:
+    try:
+        import open3d as o3d
+    except ImportError as exc:
+        raise RuntimeError("`open3d` is not installed.") from exc
+
+    geometry_type = o3d.io.read_file_geometry_type(str(ply_path))
+
+    if geometry_type & o3d.io.CONTAINS_POINTS:
+        geometry = o3d.io.read_point_cloud(str(ply_path))
+    elif geometry_type & o3d.io.CONTAINS_TRIANGLES:
+        geometry = o3d.io.read_triangle_mesh(str(ply_path))
+    else:
+        raise RuntimeError(f"Unsupported PLY geometry in {ply_path.name}")
+
+    if geometry.is_empty():
+        raise RuntimeError(f"Failed to load {ply_path.name}")
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name=ply_path.name)
+    vis.add_geometry(geometry)
+    if point_size is not None:
+        vis.get_render_option().point_size = point_size
+    vis.run()
+    vis.destroy_window()
+    return 0
+
+
+def serve_ply_viewer(
+    ply_path: Path,
+    port: int,
+    local: bool = False,
+    point_size: Optional[float] = None,
+) -> int:
     ply_path = ply_path.expanduser().resolve()
     if not ply_path.is_file():
         raise SystemExit(f"PLY file not found: {ply_path}")
 
+    if local:
+        return _show_ply_local(ply_path, point_size)
+
     ply_bytes = _build_sampled_ply_bytes(ply_path)
-    handler = _build_handler(ply_path, ply_bytes=ply_bytes)
+    handler = _build_handler(ply_path, ply_bytes=ply_bytes, point_size=point_size)
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     local_url = f"http://127.0.0.1:{port}/"
 
