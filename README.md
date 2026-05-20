@@ -40,3 +40,9 @@ You can also set a point size:
 quick-tools ply-viewer /path/to/cloud.ply --point-size 2.5
 quick-tools ply-viewer /path/to/cloud.ply --local --point-size 3.0
 ```
+
+View two PLY files with synchronized browser controls:
+
+```bash
+quick-tools ply-viewer /path/to/main.ply --and /path/to/other.ply
+```

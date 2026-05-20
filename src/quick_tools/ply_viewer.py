@@ -2,10 +2,10 @@ import html
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-MAX_BROWSER_POINTS = 2_000_000
+MAX_BROWSER_POINTS = 5_000_000
 MAX_DIRECT_FILE_BYTES = 256 * 1024 * 1024
 
 _PLY_SCALAR_SIZES = {
@@ -50,9 +50,8 @@ HTML_PAGE = """<!doctype html>
         height: 100%;
       }
 
-      #status {
+      .status {
         position: fixed;
-        top: 12px;
         left: 12px;
         z-index: 10;
         padding: 10px 12px;
@@ -60,6 +59,27 @@ HTML_PAGE = """<!doctype html>
         background: rgba(0, 0, 0, 0.68);
         font-size: 14px;
         line-height: 1.4;
+        pointer-events: none;
+      }
+
+      #status-main {
+        top: 12px;
+      }
+
+      #status-and {
+        top: calc(50% + 12px);
+        display: none;
+      }
+
+      #divider {
+        position: fixed;
+        left: 0;
+        right: 0;
+        top: 50%;
+        height: 1px;
+        z-index: 9;
+        display: none;
+        background: rgba(255, 255, 255, 0.48);
         pointer-events: none;
       }
     </style>
@@ -73,7 +93,9 @@ HTML_PAGE = """<!doctype html>
     </script>
   </head>
   <body>
-    <div id="status">Loading __TITLE_HTML__...</div>
+    <div id="status-main" class="status"></div>
+    <div id="status-and" class="status"></div>
+    <div id="divider"></div>
     <div id="app"></div>
     <script type="module">
       import * as THREE from "three";
@@ -81,9 +103,11 @@ HTML_PAGE = """<!doctype html>
       import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 
       const container = document.getElementById("app");
-      const status = document.getElementById("status");
-      const title = __TITLE_JS__;
       const requestedPointSize = __POINT_SIZE_JS__;
+      const viewSpecs = __VIEW_SPECS_JS__;
+      const isSplit = viewSpecs.length > 1;
+      const divider = document.getElementById("divider");
+      divider.style.display = isSplit ? "block" : "none";
 
       const renderer = new THREE.WebGLRenderer({ antialias: true });
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -91,22 +115,41 @@ HTML_PAGE = """<!doctype html>
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       container.appendChild(renderer.domElement);
 
-      const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x050505);
-
       const camera = new THREE.PerspectiveCamera(
         55,
-        window.innerWidth / window.innerHeight,
+        window.innerWidth / Math.max(isSplit ? window.innerHeight / 2 : window.innerHeight, 1),
         0.01,
         1e6,
       );
       camera.up.set(0, 0, 1);
-      camera.position.set(2, 2, 1.5);
+      camera.position.set(2, -2, 1.5);
 
       const controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
+      let userMovedCamera = false;
+      controls.addEventListener("start", () => {
+        userMovedCamera = true;
+      });
 
       const loader = new PLYLoader();
+      const views = viewSpecs.map((spec) => {
+        const status = document.getElementById(spec.statusId);
+        status.style.display = "block";
+        status.textContent = isSplit
+          ? `Loading ${spec.label}: ${spec.title}...`
+          : `Loading ${spec.title}...`;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x050505);
+
+        return {
+          ...spec,
+          scene,
+          status,
+          loaded: false,
+          radius: 1,
+        };
+      });
 
       function formatBytes(bytes) {
         if (!bytes || bytes < 0) return "";
@@ -120,59 +163,112 @@ HTML_PAGE = """<!doctype html>
         return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
       }
 
-      loader.load(
-        "/data.ply",
-        (geometry) => {
-          if (geometry.hasAttribute("normal")) {
-            geometry.deleteAttribute("normal");
+      function setStatusLines(element, lines) {
+        const nodes = [];
+        lines.forEach((line, index) => {
+          if (index) {
+            nodes.push(document.createElement("br"));
           }
+          nodes.push(document.createTextNode(line));
+        });
+        element.replaceChildren(...nodes);
+      }
 
-          geometry.center();
-          geometry.computeBoundingSphere();
+      function maybeFitCamera() {
+        if (userMovedCamera || views.some((view) => !view.loaded)) {
+          return;
+        }
 
-          const radius = geometry.boundingSphere?.radius || 1;
-          const material = new THREE.PointsMaterial({
-            size: requestedPointSize ?? Math.max(radius / 400, 0.0025),
-            sizeAttenuation: true,
-            vertexColors: geometry.hasAttribute("color"),
-          });
+        const radius = Math.max(...views.map((view) => view.radius), 1);
+        camera.near = Math.max(radius / 1000, 0.001);
+        camera.far = radius * 20;
+        camera.position.set(radius * 1.7, -radius * 1.7, radius * 1.1);
+        camera.updateProjectionMatrix();
+        controls.target.set(0, 0, 0);
+        controls.update();
+      }
 
-          const cloud = new THREE.Points(geometry, material);
-          scene.add(cloud);
+      function loadView(view) {
+        loader.load(
+          view.path,
+          (geometry) => {
+            if (geometry.hasAttribute("normal")) {
+              geometry.deleteAttribute("normal");
+            }
 
-          camera.near = Math.max(radius / 1000, 0.001);
-          camera.far = radius * 20;
-          camera.position.set(radius * 1.7, -radius * 1.7, radius * 1.1);
-          camera.updateProjectionMatrix();
-          controls.target.set(0, 0, 0);
-          controls.update();
+            geometry.center();
+            geometry.computeBoundingSphere();
 
-          const count = geometry.getAttribute("position").count.toLocaleString();
-          status.innerHTML = `${count} points<br />Drag to orbit, scroll to zoom`;
-        },
-        (event) => {
-          const loaded = formatBytes(event.loaded);
-          const total = formatBytes(event.total);
-          status.textContent = total
-            ? `Loading ${title}... ${loaded} / ${total}`
-            : `Loading ${title}... ${loaded}`;
-        },
-        (error) => {
-          console.error(error);
-          status.textContent = `Failed to load ${title}: ${error?.message || error}`;
-        },
-      );
+            const radius = geometry.boundingSphere?.radius || 1;
+            const material = new THREE.PointsMaterial({
+              size: requestedPointSize ?? Math.max(radius / 400, 0.0025),
+              sizeAttenuation: true,
+              vertexColors: geometry.hasAttribute("color"),
+            });
+
+            const cloud = new THREE.Points(geometry, material);
+            view.scene.add(cloud);
+            view.loaded = true;
+            view.radius = radius;
+
+            const count = geometry.getAttribute("position").count.toLocaleString();
+            const statusLines = isSplit
+              ? [`${view.label}: ${view.title}`, `${count} points`]
+              : [`${count} points`];
+            if (view.downsampleMessage) {
+              statusLines.push(view.downsampleMessage);
+            }
+            statusLines.push("Drag to orbit, scroll to zoom");
+            setStatusLines(view.status, statusLines);
+            maybeFitCamera();
+          },
+          (event) => {
+            const loaded = formatBytes(event.loaded);
+            const total = formatBytes(event.total);
+            const prefix = isSplit ? `Loading ${view.label}: ${view.title}...` : `Loading ${view.title}...`;
+            view.status.textContent = total ? `${prefix} ${loaded} / ${total}` : `${prefix} ${loaded}`;
+          },
+          (error) => {
+            console.error(error);
+            view.status.textContent = `Failed to load ${view.title}: ${error?.message || error}`;
+          },
+        );
+      }
+
+      views.forEach(loadView);
 
       window.addEventListener("resize", () => {
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
         renderer.setSize(window.innerWidth, window.innerHeight);
       });
+
+      function getViewRect(index) {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        if (!isSplit) {
+          return { x: 0, y: 0, width, height };
+        }
+
+        const bottomHeight = Math.floor(height / 2);
+        if (index === 0) {
+          return { x: 0, y: bottomHeight, width, height: height - bottomHeight };
+        }
+        return { x: 0, y: 0, width, height: bottomHeight };
+      }
+
+      function renderView(view, index) {
+        const rect = getViewRect(index);
+        camera.aspect = rect.width / Math.max(rect.height, 1);
+        camera.updateProjectionMatrix();
+        renderer.setViewport(rect.x, rect.y, rect.width, rect.height);
+        renderer.setScissor(rect.x, rect.y, rect.width, rect.height);
+        renderer.render(view.scene, camera);
+      }
 
       function animate() {
         requestAnimationFrame(animate);
         controls.update();
-        renderer.render(scene, camera);
+        renderer.setScissorTest(isSplit);
+        views.forEach(renderView);
       }
 
       animate();
@@ -185,8 +281,11 @@ HTML_PAGE = """<!doctype html>
 class _ViewerHandler(BaseHTTPRequestHandler):
     ply_path = None
     ply_bytes = None
+    and_ply_path = None
+    and_ply_bytes = None
     title = ""
     point_size = None
+    view_specs = []
 
     def do_GET(self) -> None:
         self._handle_request(send_body=True)
@@ -204,13 +303,40 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
+    def _send_ply(self, ply_path: Path, ply_bytes: Optional[bytes], send_body: bool) -> None:
+        if ply_bytes is not None:
+            size = len(ply_bytes)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            if send_body:
+                self._write_chunks(ply_bytes)
+            return
+
+        size = ply_path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        if send_body:
+            with ply_path.open("rb") as handle:
+                try:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
     def _handle_request(self, send_body: bool) -> None:
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
             content = (
                 HTML_PAGE.replace("__TITLE_HTML__", html.escape(self.title))
-                .replace("__TITLE_JS__", json.dumps(self.title))
                 .replace("__POINT_SIZE_JS__", "null" if self.point_size is None else repr(self.point_size))
+                .replace("__VIEW_SPECS_JS__", json.dumps(self.view_specs))
                 .encode("utf-8")
             )
             self.send_response(200)
@@ -222,44 +348,53 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/data.ply":
-            if self.ply_bytes is not None:
-                size = len(self.ply_bytes)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(size))
-                self.end_headers()
-                if send_body:
-                    self._write_chunks(self.ply_bytes)
-                return
+            self._send_ply(self.ply_path, self.ply_bytes, send_body)
+            return
 
-            size = self.ply_path.stat().st_size
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(size))
-            self.end_headers()
-            if send_body:
-                with self.ply_path.open("rb") as handle:
-                    try:
-                        while True:
-                            chunk = handle.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                    except (BrokenPipeError, ConnectionResetError):
-                        return
+        if path == "/and.ply" and self.and_ply_path is not None:
+            self._send_ply(self.and_ply_path, self.and_ply_bytes, send_body)
             return
 
         self.send_error(404)
 
 
-def _build_handler(ply_path: Path, ply_bytes=None, point_size=None):
+def _build_handler(
+    ply_path: Path,
+    ply_bytes=None,
+    point_size=None,
+    downsample_message=None,
+    and_ply_path=None,
+    and_ply_bytes=None,
+    and_downsample_message=None,
+):
     class Handler(_ViewerHandler):
         pass
 
     Handler.ply_path = ply_path
     Handler.ply_bytes = ply_bytes
-    Handler.title = ply_path.name
+    Handler.and_ply_path = and_ply_path
+    Handler.and_ply_bytes = and_ply_bytes
+    Handler.title = str(ply_path) if and_ply_path is None else f"{ply_path} + {and_ply_path}"
     Handler.point_size = point_size
+    Handler.view_specs = [
+        {
+            "path": "/data.ply",
+            "title": str(ply_path),
+            "label": "Top",
+            "statusId": "status-main",
+            "downsampleMessage": downsample_message,
+        }
+    ]
+    if and_ply_path is not None:
+        Handler.view_specs.append(
+            {
+                "path": "/and.ply",
+                "title": str(and_ply_path),
+                "label": "Bottom",
+                "statusId": "status-and",
+                "downsampleMessage": and_downsample_message,
+            }
+        )
     return Handler
 
 
@@ -324,7 +459,7 @@ def _read_ply_header(ply_path: Path):
                 vertex_properties.append((property_type.decode("ascii"), parts[2].decode("ascii")))
 
 
-def _build_sampled_ply_bytes(ply_path: Path) -> Optional[bytes]:
+def _build_sampled_ply_bytes(ply_path: Path) -> Optional[Tuple[bytes, int, int]]:
     file_size = ply_path.stat().st_size
     if file_size <= MAX_DIRECT_FILE_BYTES:
         return None
@@ -377,7 +512,16 @@ def _build_sampled_ply_bytes(ply_path: Path) -> Optional[bytes]:
         f"{vertex_count:,} -> {sampled_count:,} points",
         flush=True,
     )
-    return bytes(sampled)
+    return bytes(sampled), vertex_count, sampled_count
+
+
+def _prepare_browser_ply(ply_path: Path) -> Tuple[Optional[bytes], Optional[str]]:
+    sampled = _build_sampled_ply_bytes(ply_path)
+    if sampled is None:
+        return None, None
+
+    ply_bytes, original_count, sampled_count = sampled
+    return ply_bytes, f"Downsampled: {original_count:,} -> {sampled_count:,} points"
 
 
 def _show_ply_local(ply_path: Path, point_size: Optional[float]) -> int:
@@ -413,20 +557,42 @@ def serve_ply_viewer(
     port: int,
     local: bool = False,
     point_size: Optional[float] = None,
+    and_ply_path: Optional[Path] = None,
 ) -> int:
     ply_path = ply_path.expanduser().resolve()
     if not ply_path.is_file():
         raise SystemExit(f"PLY file not found: {ply_path}")
+    if and_ply_path is not None:
+        and_ply_path = and_ply_path.expanduser().resolve()
+        if not and_ply_path.is_file():
+            raise SystemExit(f"PLY file not found: {and_ply_path}")
 
     if local:
+        if and_ply_path is not None:
+            raise RuntimeError("--and is only supported in browser mode.")
         return _show_ply_local(ply_path, point_size)
 
-    ply_bytes = _build_sampled_ply_bytes(ply_path)
-    handler = _build_handler(ply_path, ply_bytes=ply_bytes, point_size=point_size)
+    ply_bytes, downsample_message = _prepare_browser_ply(ply_path)
+    and_ply_bytes = None
+    and_downsample_message = None
+    if and_ply_path is not None:
+        and_ply_bytes, and_downsample_message = _prepare_browser_ply(and_ply_path)
+
+    handler = _build_handler(
+        ply_path,
+        ply_bytes=ply_bytes,
+        point_size=point_size,
+        downsample_message=downsample_message,
+        and_ply_path=and_ply_path,
+        and_ply_bytes=and_ply_bytes,
+        and_downsample_message=and_downsample_message,
+    )
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     local_url = f"http://127.0.0.1:{port}/"
 
     print(f"Serving {ply_path}", flush=True)
+    if and_ply_path is not None:
+        print(f"Serving {and_ply_path}", flush=True)
     print(f"Open: {local_url}", flush=True)
     _print_ssh_hint(port)
 
