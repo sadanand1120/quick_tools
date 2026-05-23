@@ -1,13 +1,17 @@
 import html
 import json
+import tempfile
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 MAX_BROWSER_POINTS = 5_000_000
 MAX_DIRECT_FILE_BYTES = 256 * 1024 * 1024
 
+_POSITION_TYPES = {"float", "float32", "double", "float64", "int", "int32"}
+_COLOR_TYPES = {"uchar", "uint8"}
 _PLY_SCALAR_SIZES = {
     b"char": 1,
     b"uchar": 1,
@@ -26,6 +30,38 @@ _PLY_SCALAR_SIZES = {
     b"double": 8,
     b"float64": 8,
 }
+
+
+@dataclass
+class _PlyProperty:
+    property_type: str
+    name: str
+    offset: int = 0
+
+
+@dataclass
+class _PlyElement:
+    name: str
+    count: int
+    properties: List[_PlyProperty]
+
+
+@dataclass
+class _ColorSet:
+    label: str
+    properties: Tuple[_PlyProperty, _PlyProperty, _PlyProperty]
+
+
+@dataclass
+class _PlyContract:
+    fmt: str
+    vertex_count: int
+    vertex_properties: List[_PlyProperty]
+    position_properties: Tuple[_PlyProperty, _PlyProperty, _PlyProperty]
+    color_sets: List[_ColorSet]
+    color_properties: Optional[Tuple[_PlyProperty, _PlyProperty, _PlyProperty]]
+    vertex_stride: int
+    data_offset: int
 
 
 HTML_PAGE = """<!doctype html>
@@ -303,32 +339,14 @@ class _ViewerHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-    def _send_ply(self, ply_path: Path, ply_bytes: Optional[bytes], send_body: bool) -> None:
-        if ply_bytes is not None:
-            size = len(ply_bytes)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(size))
-            self.end_headers()
-            if send_body:
-                self._write_chunks(ply_bytes)
-            return
-
-        size = ply_path.stat().st_size
+    def _send_ply(self, ply_bytes: bytes, send_body: bool) -> None:
+        size = len(ply_bytes)
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(size))
         self.end_headers()
         if send_body:
-            with ply_path.open("rb") as handle:
-                try:
-                    while True:
-                        chunk = handle.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
-                    return
+            self._write_chunks(ply_bytes)
 
     def _handle_request(self, send_body: bool) -> None:
         path = urlparse(self.path).path
@@ -348,11 +366,11 @@ class _ViewerHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/data.ply":
-            self._send_ply(self.ply_path, self.ply_bytes, send_body)
+            self._send_ply(self.ply_bytes, send_body)
             return
 
-        if path == "/and.ply" and self.and_ply_path is not None:
-            self._send_ply(self.and_ply_path, self.and_ply_bytes, send_body)
+        if path == "/and.ply" and self.and_ply_bytes is not None:
+            self._send_ply(self.and_ply_bytes, send_body)
             return
 
         self.send_error(404)
@@ -405,17 +423,116 @@ def _print_ssh_hint(port: int) -> None:
     print(f"  then open http://127.0.0.1:{port}/ locally", flush=True)
 
 
-def _read_ply_header(ply_path: Path):
+def _decode_header_value(value: bytes, ply_path: Path) -> str:
+    try:
+        return value.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"PLY header must be ASCII: {ply_path}") from exc
+
+
+def _prop_size(prop: _PlyProperty) -> int:
+    return _PLY_SCALAR_SIZES[prop.property_type.encode("ascii")]
+
+
+def _canonical_position_type(property_type: str) -> str:
+    if property_type == "float32":
+        return "float"
+    if property_type == "float64":
+        return "double"
+    if property_type == "int32":
+        return "int"
+    return property_type
+
+
+def _validate_color_set(color_set: _ColorSet, ply_path: Path) -> None:
+    for prop in color_set.properties:
+        if prop.property_type not in _COLOR_TYPES:
+            raise RuntimeError(
+                f"Color property {prop.name} must be uchar/uint8, got {prop.property_type}: {ply_path}"
+            )
+
+
+def _append_color_set(
+    color_sets: List[_ColorSet],
+    properties_by_name: Dict[str, _PlyProperty],
+    names: Tuple[str, str, str],
+    label: str,
+    ply_path: Path,
+) -> None:
+    if not all(name in properties_by_name for name in names):
+        return
+
+    color_set = _ColorSet(label, tuple(properties_by_name[name] for name in names))
+    _validate_color_set(color_set, ply_path)
+    color_sets.append(color_set)
+
+
+def _prefix_order(properties_by_name: Dict[str, _PlyProperty], suffixes: Tuple[str, str, str]) -> List[str]:
+    prefixes = []
+    seen = set()
+    for name in properties_by_name:
+        for suffix in suffixes:
+            if name.endswith(suffix) and len(name) > len(suffix):
+                prefix = name[: -len(suffix)]
+                if prefix not in seen:
+                    seen.add(prefix)
+                    prefixes.append(prefix)
+                break
+    return prefixes
+
+
+def _find_color_sets(properties_by_name: Dict[str, _PlyProperty], ply_path: Path) -> List[_ColorSet]:
+    color_sets: List[_ColorSet] = []
+    _append_color_set(color_sets, properties_by_name, ("r", "g", "b"), "r/g/b", ply_path)
+    _append_color_set(color_sets, properties_by_name, ("red", "green", "blue"), "red/green/blue", ply_path)
+
+    for prefix in _prefix_order(properties_by_name, ("_r", "_g", "_b")):
+        names = (f"{prefix}_r", f"{prefix}_g", f"{prefix}_b")
+        _append_color_set(color_sets, properties_by_name, names, "/".join(names), ply_path)
+
+    for prefix in _prefix_order(properties_by_name, ("_red", "_green", "_blue")):
+        names = (f"{prefix}_red", f"{prefix}_green", f"{prefix}_blue")
+        _append_color_set(color_sets, properties_by_name, names, "/".join(names), ply_path)
+
+    return color_sets
+
+
+def _select_color_set(ply_path: Path, color_sets: List[_ColorSet]) -> Optional[_ColorSet]:
+    if not color_sets:
+        return None
+    if len(color_sets) == 1:
+        return color_sets[0]
+
+    print(f"Multiple RGB color sets found in {ply_path}:", flush=True)
+    for index, color_set in enumerate(color_sets, start=1):
+        print(f"  {index}. {color_set.label}", flush=True)
+
+    while True:
+        try:
+            choice = input(f"Select color set to use [1-{len(color_sets)}]: ").strip()
+        except EOFError as exc:
+            raise RuntimeError(f"Multiple RGB color sets found in {ply_path}; run interactively to choose one") from exc
+        try:
+            index = int(choice)
+        except ValueError:
+            print(f"Enter a number from 1 to {len(color_sets)}.", flush=True)
+            continue
+        if 1 <= index <= len(color_sets):
+            color_set = color_sets[index - 1]
+            print(f"Using RGB color set: {color_set.label}", flush=True)
+            return color_set
+        print(f"Enter a number from 1 to {len(color_sets)}.", flush=True)
+
+
+def _read_ply_contract(ply_path: Path) -> _PlyContract:
     with ply_path.open("rb") as handle:
         first_line = handle.readline()
         if first_line.strip() != b"ply":
-            raise RuntimeError(f"Unsupported PLY header in {ply_path}")
+            raise RuntimeError(f"Expected PLY file to start with 'ply': {ply_path}")
 
         format_name = None
-        vertex_count = None
-        vertex_stride = 0
-        vertex_properties = []
-        in_vertex_element = False
+        elements = []
+        current_element = None
 
         while True:
             line = handle.readline()
@@ -424,13 +541,8 @@ def _read_ply_header(ply_path: Path):
 
             stripped = line.strip()
             if stripped == b"end_header":
-                return {
-                    "format": format_name,
-                    "vertex_count": vertex_count,
-                    "vertex_stride": vertex_stride,
-                    "vertex_properties": vertex_properties,
-                    "data_offset": handle.tell(),
-                }
+                data_offset = handle.tell()
+                break
 
             if not stripped:
                 continue
@@ -438,106 +550,249 @@ def _read_ply_header(ply_path: Path):
             parts = stripped.split()
             keyword = parts[0]
 
-            if keyword == b"format" and len(parts) >= 2:
-                format_name = parts[1].decode("ascii")
+            if keyword in {b"comment", b"obj_info"}:
                 continue
 
-            if keyword == b"element" and len(parts) >= 3:
-                in_vertex_element = parts[1] == b"vertex"
-                if in_vertex_element:
-                    vertex_count = int(parts[2])
+            if keyword == b"format":
+                if len(parts) < 3:
+                    raise RuntimeError(f"Malformed PLY format line in {ply_path}")
+                format_name = _decode_header_value(parts[1], ply_path)
                 continue
 
-            if keyword == b"property" and in_vertex_element:
-                if len(parts) < 3 or parts[1] == b"list":
-                    raise RuntimeError(f"Unsupported vertex property layout in {ply_path}")
-                property_type = parts[1]
-                size = _PLY_SCALAR_SIZES.get(property_type)
-                if size is None:
-                    raise RuntimeError(f"Unsupported PLY property type {property_type!r} in {ply_path}")
-                vertex_stride += size
-                vertex_properties.append((property_type.decode("ascii"), parts[2].decode("ascii")))
+            if keyword == b"element":
+                if len(parts) < 3:
+                    raise RuntimeError(f"Malformed PLY element line in {ply_path}")
+                name = _decode_header_value(parts[1], ply_path)
+                try:
+                    count = int(parts[2])
+                except ValueError as exc:
+                    raise RuntimeError(f"Invalid element count for {name} in {ply_path}") from exc
+                current_element = _PlyElement(name=name, count=count, properties=[])
+                elements.append(current_element)
+                continue
+
+            if keyword == b"property":
+                if current_element is None:
+                    raise RuntimeError(f"PLY property appeared before any element in {ply_path}")
+                if len(parts) < 3:
+                    raise RuntimeError(f"Malformed PLY property line in {ply_path}")
+                if parts[1] == b"list":
+                    if len(parts) < 5:
+                        raise RuntimeError(f"Malformed PLY list property line in {ply_path}")
+                    current_element.properties.append(
+                        _PlyProperty("list", _decode_header_value(parts[4], ply_path))
+                    )
+                else:
+                    current_element.properties.append(
+                        _PlyProperty(
+                            _decode_header_value(parts[1], ply_path),
+                            _decode_header_value(parts[2], ply_path),
+                        )
+                    )
+                continue
+
+            raise RuntimeError(f"Unsupported PLY header directive {keyword!r} in {ply_path}")
+
+    if format_name not in {"ascii", "binary_little_endian", "binary_big_endian"}:
+        raise RuntimeError(f"Unsupported PLY format {format_name!r} in {ply_path}")
+
+    vertex_indices = [index for index, element in enumerate(elements) if element.name == "vertex"]
+    if not vertex_indices:
+        raise RuntimeError(f"Missing required element: vertex in {ply_path}")
+    if len(vertex_indices) > 1:
+        raise RuntimeError(f"PLY must contain exactly one vertex element: {ply_path}")
+    if vertex_indices[0] != 0:
+        raise RuntimeError(f"Vertex element must be first so other elements can be ignored: {ply_path}")
+
+    vertex_element = elements[vertex_indices[0]]
+    if vertex_element.count <= 0:
+        raise RuntimeError(f"Vertex count must be greater than zero in {ply_path}")
+
+    vertex_stride = 0
+    properties_by_name: Dict[str, _PlyProperty] = {}
+    for prop in vertex_element.properties:
+        if prop.property_type == "list":
+            raise RuntimeError(f"Vertex property {prop.name} must be scalar, not list: {ply_path}")
+        if prop.name in properties_by_name:
+            raise RuntimeError(f"Duplicate vertex property {prop.name}: {ply_path}")
+        if prop.property_type.encode("ascii") not in _PLY_SCALAR_SIZES:
+            raise RuntimeError(f"Unsupported vertex property type {prop.property_type!r}: {ply_path}")
+        prop.offset = vertex_stride
+        vertex_stride += _prop_size(prop)
+        properties_by_name[prop.name] = prop
+
+    missing_positions = [name for name in ("x", "y", "z") if name not in properties_by_name]
+    if missing_positions:
+        raise RuntimeError(f"Missing required vertex property/properties {', '.join(missing_positions)}: {ply_path}")
+
+    position_properties = tuple(properties_by_name[name] for name in ("x", "y", "z"))
+    for prop in position_properties:
+        if prop.property_type not in _POSITION_TYPES:
+            raise RuntimeError(
+                f"Position property {prop.name} must be float/double/int, got {prop.property_type}: {ply_path}"
+            )
+
+    color_sets = _find_color_sets(properties_by_name, ply_path)
+    color_properties = None
+
+    return _PlyContract(
+        fmt=format_name,
+        vertex_count=vertex_element.count,
+        vertex_properties=vertex_element.properties,
+        position_properties=position_properties,
+        color_sets=color_sets,
+        color_properties=color_properties,
+        vertex_stride=vertex_stride,
+        data_offset=data_offset,
+    )
 
 
-def _build_sampled_ply_bytes(ply_path: Path) -> Optional[Tuple[bytes, int, int]]:
-    file_size = ply_path.stat().st_size
-    if file_size <= MAX_DIRECT_FILE_BYTES:
-        return None
+def _sample_step(ply_path: Path, vertex_count: int) -> int:
+    if ply_path.stat().st_size <= MAX_DIRECT_FILE_BYTES or vertex_count <= MAX_BROWSER_POINTS:
+        return 1
+    return (vertex_count + MAX_BROWSER_POINTS - 1) // MAX_BROWSER_POINTS
 
-    header = _read_ply_header(ply_path)
-    fmt = header["format"]
-    vertex_count = header["vertex_count"]
-    vertex_stride = header["vertex_stride"]
-    data_offset = header["data_offset"]
-    vertex_properties = header["vertex_properties"]
 
-    if fmt not in {"binary_little_endian", "binary_big_endian"}:
-        raise RuntimeError(
-            f"{ply_path.name} is too large to load directly in a browser and unsupported for auto-downsampling"
-        )
-    if not vertex_count or not vertex_stride or not vertex_properties:
-        raise RuntimeError(f"Could not determine vertex layout for {ply_path.name}")
-    if vertex_count <= MAX_BROWSER_POINTS:
-        return None
+def _sampled_count(vertex_count: int, step: int) -> int:
+    return (vertex_count + step - 1) // step
 
-    step = (vertex_count + MAX_BROWSER_POINTS - 1) // MAX_BROWSER_POINTS
-    sampled_count = (vertex_count + step - 1) // step
 
+def _build_normalized_header(contract: _PlyContract, vertex_count: int) -> bytes:
     header_lines = [
         b"ply\n",
-        f"format {fmt} 1.0\n".encode("ascii"),
-        f"element vertex {sampled_count}\n".encode("ascii"),
+        f"format {contract.fmt} 1.0\n".encode("ascii"),
+        f"element vertex {vertex_count}\n".encode("ascii"),
     ]
-    header_lines.extend(
-        f"property {property_type} {property_name}\n".encode("ascii")
-        for property_type, property_name in vertex_properties
-    )
+    for prop in contract.position_properties:
+        header_lines.append(f"property {_canonical_position_type(prop.property_type)} {prop.name}\n".encode("ascii"))
+    if contract.color_properties is not None:
+        header_lines.extend([b"property uchar red\n", b"property uchar green\n", b"property uchar blue\n"])
     header_lines.append(b"end_header\n")
+    return b"".join(header_lines)
 
-    sampled = bytearray(b"".join(header_lines))
-    skip_bytes = (step - 1) * vertex_stride
+
+def _iter_ascii_tokens(handle):
+    pending = b""
+    while True:
+        chunk = handle.read(1024 * 1024)
+        if not chunk:
+            break
+        data = pending + chunk
+        parts = data.split()
+        if data[-1:].isspace():
+            pending = b""
+        elif parts:
+            pending = parts.pop()
+        else:
+            pending = data
+        for part in parts:
+            yield part
+    if pending:
+        yield pending
+
+
+def _validate_ascii_value(token: bytes, prop: _PlyProperty, ply_path: Path) -> None:
+    try:
+        if prop.property_type in {"int", "int32"}:
+            int(token)
+        elif prop.property_type in _POSITION_TYPES:
+            float(token)
+        elif prop.property_type in _COLOR_TYPES:
+            value = int(token)
+            if value < 0 or value > 255:
+                raise ValueError
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid value for vertex property {prop.name}: {token!r} in {ply_path}") from exc
+
+
+def _normalize_ascii_ply(ply_path: Path, contract: _PlyContract, step: int, count: int) -> bytes:
+    output = bytearray(_build_normalized_header(contract, count))
+    property_indices = {prop.name: index for index, prop in enumerate(contract.vertex_properties)}
+    selected_properties = list(contract.position_properties)
+    if contract.color_properties is not None:
+        selected_properties.extend(contract.color_properties)
+    selected_indices = [property_indices[prop.name] for prop in selected_properties]
 
     with ply_path.open("rb") as handle:
-        handle.seek(data_offset)
-        for _ in range(sampled_count):
-            record = handle.read(vertex_stride)
-            if len(record) != vertex_stride:
-                break
-            sampled.extend(record)
+        handle.seek(contract.data_offset)
+        tokens = _iter_ascii_tokens(handle)
+        for vertex_index in range(contract.vertex_count):
+            values = []
+            for _ in contract.vertex_properties:
+                try:
+                    values.append(next(tokens))
+                except StopIteration as exc:
+                    raise RuntimeError(f"Unexpected EOF while reading vertex data from {ply_path}") from exc
+            row = [values[index] for index in selected_indices]
+            for token, prop in zip(row, selected_properties):
+                _validate_ascii_value(token, prop, ply_path)
+            if vertex_index % step:
+                continue
+            output.extend(b" ".join(row))
+            output.extend(b"\n")
+
+    return bytes(output)
+
+
+def _normalize_binary_ply(ply_path: Path, contract: _PlyContract, step: int, count: int) -> bytes:
+    output = bytearray(_build_normalized_header(contract, count))
+    selected_properties = list(contract.position_properties)
+    if contract.color_properties is not None:
+        selected_properties.extend(contract.color_properties)
+
+    skip_bytes = (step - 1) * contract.vertex_stride
+
+    with ply_path.open("rb") as handle:
+        handle.seek(contract.data_offset)
+        for _ in range(count):
+            record = handle.read(contract.vertex_stride)
+            if len(record) != contract.vertex_stride:
+                raise RuntimeError(f"Unexpected EOF while reading vertex data from {ply_path}")
+            for prop in selected_properties:
+                output.extend(record[prop.offset : prop.offset + _prop_size(prop)])
             if skip_bytes:
                 handle.seek(skip_bytes, 1)
 
+    return bytes(output)
+
+
+def _prepare_ply(ply_path: Path) -> Tuple[bytes, Optional[str]]:
+    contract = _read_ply_contract(ply_path)
+    color_set = _select_color_set(ply_path, contract.color_sets)
+    contract.color_properties = None if color_set is None else color_set.properties
+    step = _sample_step(ply_path, contract.vertex_count)
+    count = _sampled_count(contract.vertex_count, step)
+    if contract.fmt == "ascii":
+        ply_bytes = _normalize_ascii_ply(ply_path, contract, step, count)
+    else:
+        ply_bytes = _normalize_binary_ply(ply_path, contract, step, count)
+
+    if step == 1:
+        return ply_bytes, None
+
     print(
         f"Downsampling {ply_path.name} for browser viewing: "
-        f"{vertex_count:,} -> {sampled_count:,} points",
+        f"{contract.vertex_count:,} -> {count:,} points",
         flush=True,
     )
-    return bytes(sampled), vertex_count, sampled_count
+    return ply_bytes, f"Downsampled: {contract.vertex_count:,} -> {count:,} points"
 
 
-def _prepare_browser_ply(ply_path: Path) -> Tuple[Optional[bytes], Optional[str]]:
-    sampled = _build_sampled_ply_bytes(ply_path)
-    if sampled is None:
-        return None, None
-
-    ply_bytes, original_count, sampled_count = sampled
-    return ply_bytes, f"Downsampled: {original_count:,} -> {sampled_count:,} points"
-
-
-def _show_ply_local(ply_path: Path, point_size: Optional[float]) -> int:
+def _show_ply_local(ply_path: Path, ply_bytes: bytes, point_size: Optional[float]) -> int:
     try:
         import open3d as o3d
     except ImportError as exc:
         raise RuntimeError("`open3d` is not installed.") from exc
 
-    geometry_type = o3d.io.read_file_geometry_type(str(ply_path))
-
-    if geometry_type & o3d.io.CONTAINS_POINTS:
-        geometry = o3d.io.read_point_cloud(str(ply_path))
-    elif geometry_type & o3d.io.CONTAINS_TRIANGLES:
-        geometry = o3d.io.read_triangle_mesh(str(ply_path))
-    else:
-        raise RuntimeError(f"Unsupported PLY geometry in {ply_path.name}")
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
+            tmp.write(ply_bytes)
+            tmp_path = Path(tmp.name)
+        geometry = o3d.io.read_point_cloud(str(tmp_path))
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
     if geometry.is_empty():
         raise RuntimeError(f"Failed to load {ply_path.name}")
@@ -566,17 +821,18 @@ def serve_ply_viewer(
         and_ply_path = and_ply_path.expanduser().resolve()
         if not and_ply_path.is_file():
             raise SystemExit(f"PLY file not found: {and_ply_path}")
+    if local and and_ply_path is not None:
+        raise RuntimeError("--and is only supported in browser mode.")
+
+    ply_bytes, downsample_message = _prepare_ply(ply_path)
 
     if local:
-        if and_ply_path is not None:
-            raise RuntimeError("--and is only supported in browser mode.")
-        return _show_ply_local(ply_path, point_size)
+        return _show_ply_local(ply_path, ply_bytes, point_size)
 
-    ply_bytes, downsample_message = _prepare_browser_ply(ply_path)
     and_ply_bytes = None
     and_downsample_message = None
     if and_ply_path is not None:
-        and_ply_bytes, and_downsample_message = _prepare_browser_ply(and_ply_path)
+        and_ply_bytes, and_downsample_message = _prepare_ply(and_ply_path)
 
     handler = _build_handler(
         ply_path,
